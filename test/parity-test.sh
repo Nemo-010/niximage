@@ -33,12 +33,15 @@ KEEP=${KEEP:-0}
 RUNTIME=${RUNTIME:-20}
 
 # application table: attribute, pkgforge-dev repository, arguments that make
-# the application print its version and exit
+# the application print its version and exit, and the hydra build output to
+# resolve for split-output packages (out unless stated)
 _apps() {
 	cat <<-EOF
 	htop htop-AppImage --version
+	mpv mpv-AppImage --version
 	alacritty alacritty-AppImage --version
 	yt-dlp yt-dlp-AppImage --version
+	ffmpeg ffmpeg-AppImage -version bin
 	EOF
 }
 
@@ -108,17 +111,18 @@ printf '%s\n' "-----------------------------------------------------------------
 ROWS=$WORK/rows.txt
 : > "$ROWS"
 FAILED=
-while read -r ATTR REPO ARGS; do
+while read -r ATTR REPO ARGS OUT; do
 	[ -n "$ATTR" ] || continue
 	_wanted "$@" || continue
+	OUT=${OUT:-out}
 
 	echo
 	echo "== $ATTR =="
 	CLOSURE_FILE=$WORK/$ATTR.closure
 	# shellcheck disable=SC2086
 	# shellcheck disable=SC2155
-	ROOT_PATH=$("$TESTDIR/fetch-closure.py" --attr "$ATTR" --dest "$STORE" \
-		--closure-file "$CLOSURE_FILE" | tail -n 1)
+	ROOT_PATH=$("$TESTDIR/fetch-closure.py" --attr "$ATTR" --output "$OUT" \
+		--dest "$STORE" --closure-file "$CLOSURE_FILE" | tail -n 1)
 	echo "  closure  : $ROOT_PATH"
 
 	BUILD=$WORK/$ATTR

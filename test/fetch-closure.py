@@ -192,20 +192,26 @@ def open_nar(url, compression):
 	raise RuntimeError(f"unsupported nar compression {compression!r}")
 
 
-def hydra_output(attr, jobset):
+def hydra_output(attr, jobset, output):
 	url = f"{HYDRA}/job/{jobset}/{attr}.x86_64-linux/latest"
 	req = urllib.request.Request(url, headers={"Accept": "application/json"})
 	with urllib.request.urlopen(req, timeout=60) as r:
 		build = json.load(r)
-	out = build.get("buildoutputs", {}).get("out", {})
+	outputs = build.get("buildoutputs", {})
+	out = outputs.get(output, {})
 	if "path" not in out:
-		raise RuntimeError(f"hydra job {jobset}/{attr} has no output path")
+		raise RuntimeError(
+			f"hydra job {jobset}/{attr} has no {output!r} output path "
+			f"(has: {sorted(outputs)})"
+		)
 	return out["path"]
 
 
 def main():
 	ap = argparse.ArgumentParser(description=__doc__)
 	ap.add_argument("--attr", help="hydra attribute to resolve, e.g. htop")
+	ap.add_argument("--output", default="out",
+		help="which hydra build output to resolve for split-output packages, e.g. out or bin")
 	ap.add_argument("--jobset", default="nixpkgs/trunk")
 	ap.add_argument("--store-path", help="a /nix/store path to start from")
 	ap.add_argument("--list", action="store_true", help="only list the closure, download nothing")
@@ -218,7 +224,7 @@ def main():
 	if not args.attr and not args.store_path:
 		ap.error("give --attr or --store-path")
 
-	root = args.store_path or hydra_output(args.attr, args.jobset)
+	root = args.store_path or hydra_output(args.attr, args.jobset, args.output)
 	print(f"root: {root}")
 
 	# walk the reference graph the way 'nix-store -qR' does

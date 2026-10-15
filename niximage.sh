@@ -177,12 +177,26 @@ _rewrite_desktop_exec() {
 
 # ------------ quick-sharun ------------
 
-# Point the relocated store prefix at a tree for the duration of the build.
-# quick-sharun runs the staged binaries to find what they dlopen and resolves
-# what they reference back to a file on disk, so pointing the prefix at the
-# merged /usr view is what makes every deployed library land in the flat
-# layout the AppImage uses. The AppImage itself gets a per package view of
-# the closure, created by the hook at runtime.
+# Point the relocated store prefix at the copied closure for the duration of
+# staging. Each prefix has to resolve to its own package, because an absolute
+# store symlink in one package can point at a different package.
+_relocated_store_view() {
+	rm -rf "$STOREMAP"
+	mkdir -p "$STOREMAP"
+	for p in $CLOSURE; do
+		rel=${p#"$STORE_PREFIX"/}
+		ln -sfn "$STORE_STAGE/$rel" "$STOREMAP/$rel"
+	done
+}
+
+# Point the relocated store prefix at the merged /usr view for the duration
+# of deployment. Every package name resolves to the same merged root, so a
+# store reference lands in the flat layout quick-sharun expects. quick-sharun
+# runs the staged binaries to find what they dlopen and resolves what they
+# reference back to a file on disk, so pointing the prefix at the merged /usr
+# view is what makes every deployed library land in the flat layout the
+# AppImage uses. The AppImage itself gets a per package view of the closure,
+# created by the hook at runtime.
 _relocated_view() {
 	rm -rf "$STOREMAP"
 	mkdir -p "$STOREMAP"
@@ -297,13 +311,13 @@ _find_icon() {
 			done
 			f=$(find "$FHS_STAGE/share/icons/hicolor/$size/apps" -maxdepth 1 \
 				-iname "$name.$ext" 2>/dev/null | head -n 1 || :)
-			[ -n "$f" ] && { printf '%s\n' "$f"; return 0; }
+			[ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
 		done
 	done
 	# anywhere else the package may have put it
 	f=$(find "$FHS_STAGE/share/pixmaps" "$FHS_STAGE/share/icons" -maxdepth 4 \
 		\( -iname "$name.png" -o -iname "$name.svg" \) 2>/dev/null | head -n 1 || :)
-	[ -n "$f" ] && printf '%s\n' "$f"
+	[ -f "$f" ] && printf '%s\n' "$f"
 	return 0
 }
 
@@ -366,11 +380,15 @@ _echo "Copying the closure..."
 for p in $CLOSURE; do
 	rel=${p#"$STORE_PREFIX"/}
 	src=$STORE_ROOT/$rel
-	if [ ! -d "$src" ]; then
+	if [ -d "$src" ]; then
+		cp -r "$src" "$STORE_STAGE/$rel"
+	elif [ -e "$src" ] || [ -L "$src" ]; then
+		# a closure member can be a single file, not only a directory
+		cp -P "$src" "$STORE_STAGE/$rel"
+	else
 		_err_msg "ERROR: '$src' does not exist, is STORE_ROOT correct?"
 		exit 1
 	fi
-	cp -r "$src" "$STORE_STAGE/$rel"
 done
 
 # Nix store paths are read only, and we have to edit every file
@@ -384,7 +402,7 @@ _rewrite_desktop_exec
 # the staged binaries are used by quick-sharun to find dlopened libraries, so
 # the prefix they reference has to resolve while we are still building, and
 # the absolute store symlinks have to be dereferenceable
-_relocated_view "$STORE_STAGE"
+_relocated_store_view
 
 _echo "Staging the closure as a /usr-like tree..."
 _stage_fhs
