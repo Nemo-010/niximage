@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# Stand in for the nix CLI so the test suite can drive niximage.sh through a
+# synthetic closure. Only the two invocations niximage.sh makes are answered.
+
+set -eu
+
+TESTDIR=${TESTDIR:-$(cd "$(dirname "$0")/.." && pwd)}
+
+for arg do
+	case "$arg" in
+		build)
+			cat "$TESTDIR/tmp/app.txt"
+			exit 0
+			;;
+		path-info)
+			cat "$TESTDIR/tmp/closure.txt"
+			exit 0
+			;;
+	esac
+done
+
+echo "fake nix: unsupported invocation: $*" >&2
+exit 1

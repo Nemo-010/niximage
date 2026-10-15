@@ -1,0 +1,10 @@
+#!/bin/sh
+#
+# Stand in for nix-store: 'nix-store -qR <path>' is the only thing the test
+# suite needs, and the synthetic closure only has one application.
+
+set -eu
+
+TESTDIR=${TESTDIR:-$(cd "$(dirname "$0")/.." && pwd)}
+
+cat "$TESTDIR/tmp/closure.txt"

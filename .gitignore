@@ -1,0 +1,7 @@
+AppDir/
+dist/
+niximage-work/
+test/tmp/
+result
+parity/
+__pycache__/

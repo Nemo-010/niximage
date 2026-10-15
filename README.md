@@ -1,32 +1,405 @@
 # NixImage
 
-Build fully contained AppImages with the Nix package manager!
+Turn a Nix package into a single file, anylinux AppImage, with the
+[pkgforge-dev](https://github.com/pkgforge-dev) tooling
+([quick-sharun](https://github.com/pkgforge-dev/Anylinux-AppImages) and
+[sharun](https://github.com/pkgforge-dev/Anylinux-sharun)).
 
-## What is this?
+This is a ground-up rewrite of [kolbycrouch/niximage](https://github.com/kolbycrouch/niximage).
+The original built a Nix closure, copied it into an AppDir and ran the
+application through a statically linked `proot` so that `/nix/store` would
+appear to exist. This version does not need proot, or `--library-path`
+juggling, or a custom `AppRun`, and the result runs on a machine where
+`/nix/store` has never existed.
 
-NixImage is a set of nix expressions that generates a package, it's dependencies and an environment to turn that into an AppImage.
+```sh
+APPNAME=hello MAIN_BIN=hello APP_REF=nixpkgs#hello ./niximage.sh
+# -> dist/hello-x86_64.AppImage
+```
 
-## How does this work?
+## The problem Nix has, and what we do about it
 
-We use nix to build a closure ( usually a package and it's graph of dependencies ) and copy that closure into an AppImage directory.
-We then use a loader script and binary along with statically compiled binaries for dash and proot to start the generated package.
+A Nix package is a tree in `/nix/store/<hash>-<name>`, and every file in it
+records absolute paths to the other trees it needs:
 
-## Why?
+* `PT_INTERP`, the ELF interpreter, is `/nix/store/<glibc>/lib/ld-linux-x86-64.so.2`
+* `RPATH`/`RUNPATH` name directories in the store
+* scripts start with `#!/nix/store/<bash>/bin/bash`
+* `dlopen("/nix/store/<lib>/lib/libfoo.so.1")` and store paths used as *data*
+  (font paths, data directories, plugin directories) are compiled in
+* symlinks inside the store are absolute
+* wrapper scripts (Nix's `makeWrapper`) `exec /nix/store/.../bin/whatever`
 
-Using nix and AppImage we can build a single file executable containing an application and everything it depends on except for the kernel.
-This way we can run this application on any system running a ~recent version of the kernel the package was built for.
+None of that can be made relative, which is why the original needed proot:
+a userspace chroot that made `/nix/store` resolvable inside the AppImage.
 
-# FAQ's
+The prefix `/nix/store` is exactly ten characters long, and so is
+`/tmp/xxxxx`. So the closure is copied, and every occurrence of the store
+prefix in every file is replaced by a ten character path in `/tmp` that will
+be a symlink to the closure that ships inside the AppImage:
 
-## Do I need to know nix to use this?
+```
+/nix/store/abc123-hello/bin/hello   ->   /tmp/b3d25/abc123-hello/bin/hello
+```
 
-Not for most packages. Some will require a little knowledge of nix to setup, especially if you want to customize the build.
+That is a byte for byte substitution, so it fixes the interpreter, the
+rpath, the shebangs, the `dlopen` strings, the data files and the symlink
+targets in one pass, without rewriting any ELF by hand. At runtime a hook
+creates `/tmp/b3d25` and points it at the closure inside the AppImage. This
+is the same mechanism quick-sharun already uses for hardcoded `/usr` paths,
+just applied to the store prefix. (It gives up nothing: quick-sharun's own
+`01-path-mapping-hardcoded.hook` creates two five character symlinks in
+`/tmp` for the same reason.)
 
-## Does this compile a lot of code?
+The prefix is not random: it is derived from the closure hash, so the same
+Nix inputs give the same AppImage bytes.
 
-It depends on what is built.
+## Nix in five minutes
 
-## What systems does it support?
+If you already know Nix, skip to the next section.
 
-In theory it supports any system with both nix and fuse ( Linux,FreeBSD,NetBSD etc.. ).
-In practice it has been tested only with Linux on x86_64 and aarch64.
+**The store.** Nix installs every package into `/nix/store/<hash>-<name>`.
+The hash covers the inputs of the build (source, dependencies, compiler
+flags), so two builds of the same thing are the same directory, and a
+different build is a different directory. Store paths are read only and are
+never edited in place: nothing depends on order of installation, and package
+upgrades cannot break an installed program.
+
+**Closures.** The set of store paths a program needs at runtime is its
+closure, and it is recorded in the store itself (each path lists the paths it
+references). You ask for it with `nix-store -qR <path>` or
+`nix path-info -r <path>`; the second one is the new command, the first one
+is the old workhorse. `nix build --no-link --print-out-paths <ref>` builds
+without creating a `result` symlink and prints the path it built, which is
+what a script wants. This is also why Nix programs are "not relocatable but
+also quite portable": everything is absolute, but the whole absolute world
+is a well defined, self-contained set of directories.
+
+**Why not just copy the closure?** You can, but the paths inside still say
+`/nix/store`, so without `/nix/store` on the target the interpreter is not
+found. The two honest options are to make `/nix/store` appear (proot,
+bwrap, namespaces, a FUSE mirror) or to rewrite the prefix (what this does).
+
+**Flakes.** A `flake.nix` pins the inputs (`nixpkgs`, by URL and lock file)
+and declares outputs: packages, apps, dev shells, libraries. `nix build`,
+`nix run`, `nix develop` operate on those outputs, and `nixpkgs#hello` is a
+reference to an output of a flake input. Flake evaluation is pure: it may not
+look at the network or at your home directory while evaluating. *Building*
+may use the network, which is why `fetchurl` records a hash and why a
+derivation that downloads something is called a fixed output derivation.
+This script is not a derivation: it is an impure wrapper around Nix, because
+quick-sharun downloads its own runtime and cannot run inside the Nix build
+sandbox. See *Reproducibility* below.
+
+**Wrappers.** Nix packages frequently have a shell script as the entry point,
+generated by `makeWrapper`, whose job is to set `PATH`/`LD_LIBRARY_PATH` and
+`exec` the real binary. NixImage handles those: see *Entry points* below.
+
+## The pipeline
+
+`niximage.sh`, in order:
+
+1. **Build.** `nix build --no-link --print-out-paths "$APP_REF"`, or take a
+   path you already have in `APP_STORE_PATH`.
+2. **Closure.** `nix-store -qR` (or `nix path-info -r`); everything but the
+   kernel. `CLOSURE_FILE` lets a caller supply the list itself.
+3. **Prefix.** `STOREMAP=/tmp/$(sha256 of the closure | first 5 hex)`, checked
+   to be exactly as long as `STORE_PREFIX` (which is why the store has to be
+   at `/nix/store`).
+4. **Copy** the closure into `$WORK/closure`, and `chmod -R u+w` it: store
+   paths are read only and we are about to edit them.
+5. **Rewrite** every file that contains the prefix, and every absolute
+   symlink target, and the `Exec=` of any `.desktop` file.
+6. **Store view.** Point `STOREMAP` at a tree for the duration of the build.
+   This matters more than it looks: quick-sharun *runs* the staged binaries to
+   find out what they `dlopen`, and resolves what they reference back to a
+   file on disk. Pointing the prefix at the merged `/usr` tree in step 7
+   makes every collected library resolve to a file whose destination
+   quick-sharun computes as a flat name in `AppDir/lib`, which is exactly the
+   layout it wants. Pointing it at the store layout instead produces the
+   store layout inside `AppDir/lib`, which is ugly and enlarges `lib.path`.
+7. **Merge** the closure into one `/usr`-like tree `$WORK/usr`, by
+   hardlinking each package's `bin`, `lib`, `lib64`, `libexec`, `share`,
+   `etc`, `include`, `sbin` into a single prefix. Hardlinking keeps it cheap,
+   dereferencing makes it flat.
+8. **Hook.** Write `AppDir/bin/00-nix-store.hook`, which at runtime turns the
+   relocated prefix into a directory of symlinks into `AppDir/nix/store`.
+   A hook, not an `AppRun`: `AppRun` belongs to sharun, and quick-sharun
+   sources every `AppDir/bin/*.hook` from the `AppRun.sh` it generates.
+9. **Deploy** with quick-sharun, with `LIB_DIR` pointing at the staged `/usr`
+   tree and the application's binary and dynamic linker as arguments.
+   `LIB_DIR` is the point of step 7: quick-sharun's "install the application
+   to `/usr` first" rule is about it being able to find libraries in one
+   predictable place, and the staged tree is our `/usr`. Every library that
+   ends up in the AppImage is therefore from the closure, not from the host
+   the AppImage is built on.
+10. **Ship the closure.** `AppDir/nix/store` is a copy of the rewritten
+    closure. Deliberately *after* step 9, so that quick-sharun's scans,
+    `strip` and hardcoded path patching do not touch it: the store copy has to
+    stay a faithful, complete Nix store, because that is what every remaining
+    absolute path in the application resolves against.
+11. **`quick-sharun --make-appimage`** produces the DWARFS AppImage with the
+    sharun runtime.
+
+Then at runtime:
+
+1. sharun mounts the AppImage (or extracts it, with
+   `APPIMAGE_EXTRACT_AND_RUN=1`, when there is no `/usr/bin/fuse` to be
+   found), sets up `APPDIR`, `PATH` and the library path, and sources the
+   hooks.
+2. `00-nix-store.hook` makes `/tmp/xxxxx/<package>` a symlink to
+   `$APPDIR/nix/store/<package>`, for every package in the closure.
+3. The application's interpreter, rpaths, shebangs and data paths all point
+   at `/tmp/xxxxx/...`, which now resolves inside the AppImage. Children
+   `exec`'d by store path find their interpreter there as well, and their own
+   rpaths resolve within the closure.
+
+Nothing in that chain is a library list someone typed by hand. Which
+libraries are deployed, and where, remains quick-sharun's decision; the
+closure is the store itself, not a bundle of picked .so files.
+
+## Requirements and warnings
+
+* **Packaging on anything but Arch Linux is a very bad idea.** That is
+  quick-sharun's own requirement, not a preference of this script: it runs
+  the staged binaries, resolves the host's `ldd` output, and patches
+  hardcoded `/usr` paths, all of which assume an Arch-like layout. The
+  AppImage you produce is fine on any distribution; it is the *build* that
+  should happen on Arch (or an Arch container).
+* **The application must be installed to `/usr` before it is deployed.** In
+  NixImage, "installed to `/usr`" is the staged tree built in step 7, which is
+  what `LIB_DIR` points at. Do not point `LIB_DIR` at a nix store tree and
+  expect pkgforge tooling to make sense of it.
+* **Do not remove libraries, and do not copy them by hand.** Pass the
+  application and its dynamic linker to quick-sharun and let it resolve the
+  rest; if something is missing, that is a bug to report, not a library to
+  add by hand.
+* `APPIMAGE_EXTRACT_AND_RUN=1` runs the AppImage without FUSE. On a machine
+  without `/dev/fuse` (a container, a CI runner) that is the way to start it.
+* The store copy makes the AppImage bigger than the same application
+  packaged the usual way: the closure includes things FHS deployment would
+  not pick, and the store copy duplicates what quick-sharun already deployed.
+  dwarfs dedupes it at build time (in the test closure, 1044 of 2975 files are
+  found to be duplicates), and the result compresses well, but it is not
+  free.
+
+## Usage
+
+Everything is configured through the environment:
+
+| variable | meaning |
+| --- | --- |
+| `APPNAME` | name of the application; used for the desktop entry and icon lookup and the output name |
+| `MAIN_BIN` | the binary to launch, looked up in `usr/bin` then `usr/sbin` (default: `$APPNAME`) |
+| `APP_REF` | a flake reference or installable to build, e.g. `nixpkgs#retroarch`, `.#mypackage` |
+| `APP_STORE_PATH` | an already built store path, used instead of `APP_REF` |
+| `CLOSURE_FILE` | a file with one store path per line, used instead of asking Nix |
+| `DESKTOP`, `ICON` | bypass the automatic lookup in the staged tree |
+| `APPDIR`, `OUTPATH`, `OUTNAME` | where to build and what to call the result |
+| `WORK` | scratch directory for the closure copy and the staged tree |
+| `STORE_ROOT` | where the store actually is, for a store not mounted at `/nix/store` |
+| `QUICK_SHARUN`, `QUICK_SHARUN_LINK` | the packager to use, and where to get it |
+
+Examples are in `examples/`:
+
+```sh
+examples/hello.sh      # the smallest useful run
+examples/retroarch.sh  # a real desktop application with a wrapper entry point
+```
+
+The flake wraps the same thing:
+
+```sh
+nix develop                              # the tooling quick-sharun needs
+nix run .#niximage                       # with APPNAME/APP_REF in the environment
+nix run .#hello-appimage                 # a nixpkgs hello AppImage, as a demo
+```
+
+`lib.mkAppImage` binds an application to the packager, so a project can
+expose its own AppImage build:
+
+```nix
+niximage.lib.mkAppImage pkgs {
+  package = myPackage;
+  name = "myapp";
+  mainBin = "myapp";
+}
+```
+
+The flake is a convenience wrapper around `niximage.sh`, which is the tested
+entry point: everything in the test suite below runs the script directly, and
+the flake only exists so that the tooling is pinned and the same command can
+be used from a development shell.
+
+## Entry points
+
+If `MAIN_BIN` is a shell script (a Nix `makeWrapper` wrapper, typically),
+quick-sharun rewrites its shebang to `#!/usr/bin/env <interpreter>`, and
+sharun puts `AppDir/bin` on `PATH`. For the wrapper to be able to run at all,
+the interpreter has to be in the AppImage, so NixImage reads the shebang and
+passes that interpreter to quick-sharun as well. Without that step a wrapper
+script would silently fall back to whatever interpreter the host happens to
+have.
+
+Nix wrappers often carry arguments in the shebang
+(`#!/nix/store/<bash>/bin/bash -e`, which is what `makeWrapper` produces), and
+`#!/usr/bin/env bash -e` cannot be executed at all: `env` takes `bash -e` as a
+single command name. After deploying, NixImage notices shebangs that lost
+arguments that way and points them at the closure's own copy of the
+interpreter, which keeps the arguments and is a path that is valid at runtime.
+
+A command line application has no desktop entry, and quick-sharun requires
+one. NixImage then asks for a dummy entry, which is what the pkgforge
+AppImages of such applications do as well: quick-sharun writes a hidden one
+(`Hidden=true`), and every AppImage has to get its icon from somewhere, so an
+empty icon is used unless `ICON` says otherwise.
+
+## Limitations
+
+* The substitution is textual, so a file whose *contents* are checksummed or
+  signed over a region containing the store path will be corrupted. That has
+  not been seen in a Nix closure, but it is the mechanism's one sharp edge.
+* `STORE_PREFIX` must be exactly as long as the replacement, i.e. `/nix/store`.
+* Only paths under the store prefix are relocated. A package that expects
+  something else the host is supposed to provide (a hardcoded `/usr/bin/...`,
+  `/etc` entries, D-Bus policies, udev rules) is in quick-sharun's hands, and
+  quick-sharun patches the common `/usr` and `/etc` cases.
+* Packages that need to *use* Nix at runtime (`nix-shell` shebangs,
+  `nix-store` lookups, `NIX_PATH`) will not work. The AppImage carries a store
+  copy, not a Nix installation.
+* Anything the application downloads and executes at runtime is outside the
+  closure and therefore not guaranteed to work anywhere. This is a general
+  property of such applications, but it is worth saying out loud, because the
+  rest of this design gives a false impression of completeness.
+* The Nix store's hardlink deduplication does not survive the copy into the
+  AppImage; dwarfs recovers most of it. The store copy is also duplicated by
+  quick-sharun's own deployment, which dwarfs also dedupes.
+* setuid binaries, capabilities, and multi-process sandboxing helpers
+  (`bwrap`-based ones, for instance) are not covered: an AppImage cannot give
+  them what they need.
+* Two AppImages built from the same closure use the same `/tmp/xxxxx` name.
+  The hook refreshes the directory every run, so this is fine, but if that
+  path is occupied by a directory that belongs to somebody else, the
+  application will not start. `TMPDIR` is not consulted, because the path is
+  baked into the binaries.
+
+## Reproducibility
+
+The closure is pinned by Nix, and the relocated prefix is derived from the
+closure hash, so the same inputs relocate to the same paths. The *packaging*
+step is not hermetic: `niximage.sh` downloads quick-sharun (pinned to a
+commit), quick-sharun downloads sharun and the AppImage runtime, and
+`appimagetool` embeds whatever it embeds. Reproducible AppImages would need
+those inputs to be fixed output derivations, which is a possible extension,
+and would also let the whole thing run inside `nix build`. (The DWARFS
+runtime in this repository's tooling honours `SOURCE_DATE_EPOCH` for the
+mtimes it writes, which is the other half of the problem.)
+
+## Tests
+
+There are two suites in `test/`: one that packages a synthetic closure and
+checks every mechanism, and one that packages real Nix packages and compares
+them with the pkgforge-dev AppImages of the same applications.
+
+`test/run-test.sh` builds a synthetic Nix store in `test/tmp/store`: six
+fake packages with fixed store hashes, containing a program whose data file
+path, `dlopen` path and child processes are store paths, a script with a
+store shebang, a symlink into another package, and a fake `nix`/`nix-store`
+to stand in for the real commands. Then it packages that closure twice — once
+with the ELF as the entry point, once with the script — and runs both
+AppImages with `env -i` on a machine that has no `/nix/store` at all.
+
+The assertions are mechanism by mechanism:
+
+* `DATA`, `REALPATH` — a store path compiled in as data is read, and resolves
+  inside the running AppImage
+* `DLOPEN`, `LIBHELLO` — `dlopen` by absolute store path, and the library's
+  constructor
+* `HELPER`, `SCRIPT` — children `exec`'d by absolute store path, including
+  one whose shebang is a store interpreter, which means `PT_INTERP` and the
+  shebang rewrite both worked
+* `EXE` — the process `argv0`/`/proc/self/exe` is the sharun launcher rather
+  than the dynamic linker
+* the AppImage contains its own `libc.so.6` and `ld-linux-x86-64.so.2`
+* a script entry point gets its interpreter deployed next to it
+* no file in the AppImage points at the directory it was built in
+* the hook created the relocated prefix, and it resolves into the running
+  AppImage
+* a negative control: the same binary run from the fake store, before
+  relocation, must fail
+
+It needs a host without `/nix/store`, `patchelf`, a C compiler and `wget`,
+and it downloads quick-sharun from the Electrosphere on the first run.
+`KEEP=1 ./test/run-test.sh` leaves the AppDir behind to look at.
+
+## Testing against the pkgforge AppImages
+
+Real Nix packages are tested too, by comparing against the pkgforge-dev
+AppImage of the same application. `test/parity-test.sh` does that for one
+application at a time, and for each of them:
+
+1. resolves a nixpkgs attribute to a store path through Hydra (no Nix needed,
+   and no evaluation of nixpkgs either), unless the attribute is given as a
+   store path;
+2. fetches that closure from the official binary cache:
+   `test/fetch-closure.py` walks the reference graph through the `.narinfo`
+   files, unpacks every path into a store layout of its own, and verifies each
+   one against the `NarHash` in its narinfo while unpacking. That is the same
+   closure `nix build` would have produced, obtained a different way;
+3. builds an AppImage from it with `niximage.sh`;
+4. downloads the pkgforge-dev AppImage of the same application;
+5. runs both with the same arguments, on a machine with no `/nix/store` and no
+   FUSE;
+6. checks that the deployed libraries are enough for the deployed binaries, by
+   resolving their dependencies the way sharun does, with
+   `LD_LIBRARY_PATH=$APPDIR/lib`;
+7. checks that the version the Nix built application reports is a version the
+   pkgforge build of the same application reports.
+
+The two builds are not expected to be byte identical: different packagers, at
+different times, from different dependency sets. One run here looked like
+this (x86_64, Artix, no `/nix/store`):
+
+```
+application  nix        pkgforge   nix-size  pkg-size  version
+------------------------------------------------------------------
+htop         ok         ok         13M       2.4M      ok
+  nix: htop 3.5.3        pkgforge: htop 3.5.3-3.5.3
+alacritty    ok         ok         51M       20M       ok
+  nix: alacritty 0.17.0  pkgforge: alacritty 0.17.0 (94e7c887)
+yt-dlp       ok         ok         189M      20M       ok
+  nix: 2026.08.19       pkgforge: 2026.08.19
+```
+
+All three ran, from the closures that were fetched for them, and the version
+strings agree. The size difference is real and expected: a Nix closure carries
+its own copy of everything the application declares, while an Arch package
+depends on libraries the distribution already provides, and the AppImage also
+ships the closure next to the libraries quick-sharun deployed. For `yt-dlp`
+that means the Python runtime, `curl-cffi` and the rest of its Python
+dependencies come along on the Nix side, where the pkgforge build relies on
+what its build machine had installed.
+
+Run it for a subset like this:
+
+```sh
+./test/parity-test.sh htop alacritty      # only these two
+./test/parity-test.sh                     # the whole list in the script
+KEEP=1 ./test/parity-test.sh htop         # leave the AppDir behind
+```
+
+It needs `gh` (for the release asset), `python3` with `compression.zstd` for
+zstd nars, and a network that can reach `cache.nixos.org`, `hydra.nixos.org`
+and GitHub.
+
+## Credits
+
+* [kolbycrouch/niximage](https://github.com/kolbycrouch/niximage) — the
+  original idea and the proot based implementation this replaces.
+* [pkgforge-dev/Anylinux-AppImages](https://github.com/pkgforge-dev/Anylinux-AppImages)
+  (quick-sharun) and
+  [pkgforge-dev/Anylinux-sharun](https://github.com/pkgforge-dev/Anylinux-sharun)
+  (sharun), and
+  [pkgforge-dev/appimagetool](https://github.com/pkgforge-dev/appimagetool).
+
+BSD 2-Clause, see `LICENSE`.
